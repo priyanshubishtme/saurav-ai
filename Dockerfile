@@ -10,7 +10,10 @@ COPY package.json package-lock.json ./
 COPY backend/package.json ./backend/package.json
 COPY frontend/package.json ./frontend/package.json
 
-RUN npm ci --omit=dev --workspace backend --include-workspace-root=false
+# Skip postinstall here. It runs backend/scripts/install-chromium.js, and those
+# scripts are copied only after dependencies are installed. The next step installs
+# the matching Chromium build together with its Debian libraries.
+RUN npm ci --omit=dev --workspace backend --include-workspace-root=false --ignore-scripts
 
 # Install the browser matching the locked Playwright version plus Debian libraries.
 RUN npm exec --workspace backend -- playwright install --with-deps chromium
@@ -24,4 +27,4 @@ RUN npm run build --workspace backend \
 EXPOSE 3001
 USER node
 
-CMD ["npm", "run", "start", "--workspace", "backend"]
+CMD ["node", "backend/src/server.js"]
