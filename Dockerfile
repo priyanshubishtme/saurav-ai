@@ -16,7 +16,8 @@ COPY frontend/package.json ./frontend/package.json
 RUN npm ci --omit=dev --workspace backend --include-workspace-root=false --ignore-scripts
 
 # Install the browser matching the locked Playwright version plus Debian libraries.
-RUN npm exec --workspace backend -- playwright install --with-deps chromium
+# Call the package CLI directly. `npm exec` cannot see the workspace binary in this image.
+RUN node ./node_modules/playwright/cli.js install --with-deps chromium
 
 COPY backend/src ./backend/src
 COPY backend/scripts ./backend/scripts
