@@ -6,6 +6,7 @@ import AppShell from "./components/AppShell.jsx";
 import { ToastProvider } from "./components/ToastProvider.jsx";
 import {
   DashboardPage,
+  FixAllPage,
   IssueDetailPage,
   NewAuditPage,
   ReportsPage,
@@ -34,6 +35,7 @@ function ApplicationRoutes() {
           <Route element={<AppShell />}>
             <Route index element={<DashboardPage />} />
             <Route path="audits/new" element={<NewAuditPage />} />
+            <Route path="fix-all" element={<FixAllPage />} />
             <Route path="audits/results" element={<ResultsPage />} />
             <Route path="audits/:auditId/issues/:issueId" element={<IssueDetailPage />} />
             <Route path="workspace" element={<RepairWorkspacePage />} />

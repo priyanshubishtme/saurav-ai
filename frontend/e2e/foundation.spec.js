@@ -28,6 +28,44 @@ test("keeps navigation usable at a mobile viewport", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("keeps auth modes responsive and confines the neural animation to auth", async ({ page }) => {
+  await page.setViewportSize({ width: 360, height: 780 });
+  await page.route("**/api/auth/me", (route) => route.fulfill({
+    status: 401,
+    contentType: "application/json",
+    body: JSON.stringify({ error: { code: "AUTH_REQUIRED", message: "Sign in to continue." } }),
+  }));
+  await page.goto("/login");
+
+  await expect(page.getByRole("heading", { name: "Welcome back" })).toBeVisible();
+  await expect(page.locator(".auth-neural-canvas")).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+
+  await page.getByRole("button", { name: "Show password" }).click();
+  await expect(page.locator("#account-password")).toHaveAttribute("type", "text");
+  await expect(page.getByRole("button", { name: "Hide password" })).toHaveAttribute("aria-pressed", "true");
+
+  await page.getByRole("link", { name: "Create an account" }).click();
+  await expect(page.getByRole("heading", { name: "Make room for everyone." })).toBeVisible();
+  await expect(page.getByLabel("Full name")).toBeVisible();
+  await expect(page.locator("#account-confirm-password")).toBeVisible();
+  await page.getByRole("button", { name: "Show confirmation password" }).click();
+  await expect(page.locator("#account-confirm-password")).toHaveAttribute("type", "text");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+
+  await page.getByRole("link", { name: "Sign in", exact: true }).click();
+  await page.getByLabel("Email or username").fill("browser-test");
+  await page.locator("#account-password").fill("example-password");
+  await page.getByRole("button", { name: "Sign in to AccessZ" }).click();
+  await expect(page.getByRole("link", { name: "AccessZ home" })).toBeVisible();
+  await expect(page.locator(".auth-neural-canvas")).toHaveCount(0);
+
+  await page.setViewportSize({ width: 1365, height: 900 });
+  await page.goto("/login");
+  await expect(page.locator(".auth-neural-canvas")).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
 test("keeps account audit history on the API and does not fall back to browser-local snapshots", async ({ page }) => {
   await page.goto("/audits/new");
   await page.getByRole("button", { name: /scan the built-in sample/i }).click();

@@ -50,7 +50,7 @@ export class RepairService {
     const violation = audit.violations.find((item) => item.id === input.violationId);
     if (!violation) throw new RepairError("FINDING_NOT_FOUND", "This accessibility finding is not part of the selected audit.", 404);
     const artifactAudit = { ...audit, sourceType: "html", previewHtml: artifact.html };
-    const cssSource = input.cssSource ?? (audit.sourceType === "url" ? audit.additionalCss ?? "" : "");
+    const cssSource = input.cssSource ?? artifact.additionalCss ?? audit.additionalCss ?? audit.capturedCss ?? "";
     const finding = prepareFindingContext(artifactAudit, violation, input.nodeIndex, cssSource);
     const deterministic = () => deterministicProposal({
       ruleId: violation.id,
@@ -58,6 +58,7 @@ export class RepairService {
       nearbyLabelText: finding.nearbyLabelText,
       styleEvidence: finding.context.styleEvidence,
       cssEvidence: finding.context.cssEvidence,
+      context: finding.context,
     });
 
     let proposal;
@@ -71,7 +72,18 @@ export class RepairService {
     } else {
       try {
         const generated = await this.provider.suggest(finding.context);
-        proposal = normalizeProposal(generated, finding.targetCode, violation.id);
+        proposal = normalizeProposal(generated, finding.targetCode, violation.id, finding.context);
+        source = "groq";
+        if (!proposal.applicable && proposal.proposedCode === finding.targetCode) {
+          const provisional = deterministic();
+          if (provisional.proposedCode !== finding.targetCode) {
+            proposal = provisional;
+            source = "deterministic";
+            fallbackReason = proposal.demoContent
+              ? "Groq returned no evidence-supported patch; showing a demo-text fallback for human review."
+              : "Groq returned no evidence-supported patch; showing a deterministic fallback.";
+          }
+        }
         if (violation.id === "color-contrast" && proposal.applicable) {
           proposal = validateContrastCandidate(proposal, finding.targetCode, finding.context.styleEvidence);
           if (!proposal.applicable) {
@@ -84,7 +96,6 @@ export class RepairService {
         if (!proposal.applicable && violation.id === "color-contrast") {
           source = "manual";
         }
-        if (proposal.applicable) source = "groq";
         this.providerState = { ...this.provider.getStatus(), status: "available", lastErrorCode: null };
       } catch (error) {
         if (error instanceof RepairError && error.code === "INVALID_SUGGESTION") {
@@ -113,12 +124,14 @@ export class RepairService {
       artifactId: artifact.id,
       artifactVersion: artifact.version,
       artifactContentHash: createHash("sha256").update(artifact.html).digest("hex"),
+      additionalCss: artifact.additionalCss ?? "",
       baselineAuditId: audit.id,
       baselineSnapshot: freezeSnapshot(audit),
       violationId: violation.id,
       nodeIndex: input.nodeIndex,
       selector: finding.repairSelector,
       originalCode: finding.targetCode,
+      nearbyLabelText: finding.nearbyLabelText,
       proposedCode: proposal.proposedCode,
       patchHash: createHash("sha256").update(JSON.stringify({
         artifactId: artifact.id,
@@ -152,6 +165,8 @@ export class RepairService {
       expectedVerificationCriteria: proposal.expectedVerificationCriteria,
       assumptions: proposal.assumptions,
       manualReviewRequired: proposal.manualReviewRequired,
+      requiresHumanInput: proposal.requiresHumanInput === true,
+      demoContent: proposal.demoContent === true,
       applicable: proposal.applicable,
       source,
       providerStatus: this.getStatus(),
@@ -196,6 +211,7 @@ export class RepairService {
       repair.originalCode,
       repair.proposedCode,
       repair.violationId,
+      { nearbyLabelText: repair.nearbyLabelText },
     );
     repair.rollbackArtifact = rollbackArtifact;
     repair.sourceArtifact = source;
@@ -211,6 +227,7 @@ export class RepairService {
     repair.acceptedAt = new Date().toISOString();
     repair.appliedAt = repair.acceptedAt;
     repair.status = "applied";
+    repair.contentHumanConfirmed = manualReviewConfirmed === true;
     return repair;
   }
 

@@ -22,6 +22,8 @@ const MAX_ACTIVE_SCANS = 2;
 const MAX_QUEUED_SCANS = 4;
 const MAX_STORED_AUDITS = 25;
 const MAX_TAB_STEPS = 15;
+const MAX_CAPTURED_SOURCE_BYTES = 300_000;
+const MAX_CAPTURED_CSS_BYTES = 100_000;
 const require = createRequire(import.meta.url);
 const WCAG_TAGS = Object.freeze({
   A: ["wcag2a", "wcag21a"],
@@ -237,6 +239,61 @@ async function captureContrastEvidence(page, violations) {
         };
       }
     }
+  }
+}
+
+async function captureRenderedSource(page) {
+  try {
+    const html = await page.content();
+    const styles = await page.evaluate((cssLimit) => {
+      const pageDocument = globalThis.document;
+      const accessible = [];
+      const inaccessible = [];
+      const authenticationLikely = Boolean(pageDocument.querySelector('input[type="password"], form[action*="login" i], form[action*="signin" i]'))
+        || /(?:sign in|log in|authentication required)/i.test(pageDocument.title);
+      let totalBytes = 0;
+      for (const sheet of pageDocument.styleSheets) {
+        const href = sheet.href || "inline style";
+        try {
+          const css = [...sheet.cssRules].map((rule) => rule.cssText).join("\n");
+          const bytes = new TextEncoder().encode(css).length;
+          if (totalBytes + bytes > cssLimit) {
+            inaccessible.push({ url: href, reason: "capture-size-limit" });
+            continue;
+          }
+          totalBytes += bytes;
+          if (css.trim()) accessible.push({ url: href, css });
+        } catch {
+          inaccessible.push({ url: href, reason: "cross-origin-or-unavailable" });
+        }
+      }
+      return { accessible, inaccessible, authenticationLikely };
+    }, MAX_CAPTURED_CSS_BYTES - 5_000);
+    if (Buffer.byteLength(html, "utf8") > MAX_CAPTURED_SOURCE_BYTES) {
+      return {
+        available: false,
+        reason: "The rendered HTML exceeds the 300 KB source-capture limit; it was not truncated.",
+        inaccessibleStylesheets: styles.inaccessible,
+        capturedStylesheets: styles.accessible.length,
+        authenticationLikely: styles.authenticationLikely,
+      };
+    }
+    return {
+      available: true,
+      renderedHtml: html,
+      capturedCss: styles.accessible.map((sheet) => sheet.css).join("\\n\\n"),
+      inaccessibleStylesheets: styles.inaccessible,
+      capturedStylesheets: styles.accessible.length,
+      accessibleStylesheetUrls: styles.accessible.map((sheet) => sheet.url),
+      authenticationLikely: styles.authenticationLikely,
+    };
+  } catch {
+    return {
+      available: false,
+      reason: "Rendered source capture failed; the live page was scanned but cannot be safely edited as a controlled candidate.",
+      inaccessibleStylesheets: [],
+      capturedStylesheets: 0,
+    };
   }
 }
 
@@ -514,6 +571,9 @@ async function performScan(input, { signal, requestId }) {
     }
 
     if (response && response.status() >= 400) {
+      if ([401, 403].includes(response.status())) {
+        throw new ScanError("TARGET_AUTH_REQUIRED", `The page returned HTTP ${response.status()} and may require authentication. The scanner does not log in or bypass access controls.`, 502);
+      }
       throw new ScanError("TARGET_HTTP_ERROR", `The page returned HTTP ${response.status()}; only successful page responses can be scanned.`, 502);
     }
     throwIfAborted(signal);
@@ -535,6 +595,7 @@ async function performScan(input, { signal, requestId }) {
 
     const results = normalizeAxeResults(rawResults);
     await captureContrastEvidence(page, results.violations);
+    const sourceCapture = input.sourceType === "url" ? await captureRenderedSource(page) : null;
     const keyboardAudit = preview
       ? await runKeyboardReview(page, signal)
       : { status: "not_run", capturedFocus: [], candidates: [] };
@@ -542,6 +603,7 @@ async function performScan(input, { signal, requestId }) {
     const score = calculateA11yScore(results);
     const source = preview ? safeProjectName(input.projectName) : input.url;
     const finalUrl = preview ? null : page.url();
+    if (sourceCapture) sourceCapture.httpStatus = response?.status() ?? null;
 
     return {
       id: randomUUID(),
@@ -574,6 +636,11 @@ async function performScan(input, { signal, requestId }) {
       keyboardAudit,
       ...(preview ? { previewHtml: preview.html, previewOrigin: preview.origin } : {}),
       ...(input.additionalCss ? { additionalCss: input.additionalCss } : {}),
+      ...(sourceCapture ? { sourceCapture } : {}),
+      ...(sourceCapture?.available ? {
+        renderedHtml: sourceCapture.renderedHtml,
+        capturedCss: sourceCapture.capturedCss,
+      } : {}),
       blockedRequests: blockedRequests.slice(0, 25),
       scanLimitations: getScanLimitations({ sourceType: input.sourceType, blockedRequests }),
     };

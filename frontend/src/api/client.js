@@ -133,6 +133,26 @@ export function suggestRepair(payload, options = {}) {
   return request("/repairs/suggest", { ...options, method: "POST", body: JSON.stringify(payload) });
 }
 
+export function proposeBulkRepair(payload, options = {}) {
+  return request("/repairs/bulk/suggest", { ...options, method: "POST", body: JSON.stringify(payload) });
+}
+
+export function applyBulkRepair(payload, options = {}) {
+  return request("/repairs/bulk/apply", { ...options, method: "POST", body: JSON.stringify(payload) });
+}
+
+export function verifyBulkRepair(id, options = {}) {
+  return request(`/repairs/bulk/${encodeURIComponent(id)}/verify`, { ...options, method: "POST" });
+}
+
+export function rollbackBulkRepair(artifactId, draftId, options = {}) {
+  return request(`/artifacts/${encodeURIComponent(artifactId)}/bulk-rollback`, {
+    ...options,
+    method: "POST",
+    body: JSON.stringify(draftId ? { draftId } : {}),
+  });
+}
+
 export function applyRepair(id, manualReviewConfirmed, review, options = {}) {
   return request(`/repairs/${encodeURIComponent(id)}/apply`, {
     ...options,

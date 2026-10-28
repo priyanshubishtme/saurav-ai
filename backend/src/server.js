@@ -16,7 +16,7 @@ export function createApiServer({
   return server;
 }
 
-export async function startApiServer() {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const scannerDiagnostic = await getScannerDiagnostics();
   if (scannerDiagnostic.status === "available") {
     console.info("Playwright startup check: Chromium executable is available.");
@@ -40,9 +40,4 @@ export async function startApiServer() {
       });
     });
   }
-  return server;
-}
-
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  await startApiServer();
 }

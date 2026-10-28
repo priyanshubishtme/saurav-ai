@@ -33,6 +33,7 @@ import {
   getAuditRepairs,
   getAudits,
   getControlledArtifacts,
+  getControlledArtifact,
   getHealth,
   getVerifications,
   rejectRepair,
@@ -100,6 +101,138 @@ function getFindingGuidance(violation) {
     impact: "The effect depends on the affected element and its context. Review the evidence before deciding how users are affected.",
     fix: "Use the axe-core rule guidance and inspect the affected element in context. Automated findings may need human review.",
   };
+}
+
+function summarizeHtmlPatch(originalCode, proposedCode) {
+  const readElement = (markup) => {
+    if (/^\s*<html\b/i.test(markup)) {
+      return new DOMParser().parseFromString(`${markup}<head></head><body></body></html>`, "text/html").documentElement;
+    }
+    const template = document.createElement("template");
+    template.innerHTML = markup;
+    return template.content.children.length === 1 ? template.content.firstElementChild : null;
+  };
+  const original = readElement(originalCode);
+  const proposed = readElement(proposedCode);
+  if (!original || !proposed) return ["Review the validated replacement shown in the AFTER panel."];
+  if (proposed.tagName === "LABEL" && proposed.querySelector("input, select, textarea")) {
+    const control = proposed.querySelector("input, select, textarea");
+    const labelText = [...proposed.childNodes].filter((node) => node.nodeType === 3).map((node) => node.textContent.trim()).filter(Boolean).join(" ");
+    return [`Add visible associated label “${labelText}”.`, `Keep the original ${control.tagName.toLowerCase()} control and its attributes unchanged.`];
+  }
+  if (original.tagName !== proposed.tagName) return ["Review the validated scoped replacement shown in the AFTER panel."];
+
+  const changes = [];
+  const originalAttributes = new Map([...original.attributes].map(({ name, value }) => [name, value]));
+  const proposedAttributes = new Map([...proposed.attributes].map(({ name, value }) => [name, value]));
+  for (const [name, value] of proposedAttributes) {
+    if (!originalAttributes.has(name)) changes.push(`Add ${name}="${value}".`);
+    else if (originalAttributes.get(name) !== value) changes.push(`Change ${name} from "${originalAttributes.get(name)}" to "${value}".`);
+  }
+  for (const name of originalAttributes.keys()) {
+    if (!proposedAttributes.has(name)) changes.push(`Remove ${name}.`);
+  }
+  if (original.innerHTML !== proposed.innerHTML) {
+    const addedText = proposed.textContent.replace(original.textContent, "").replace(/\s+/g, " ").trim();
+    changes.push(addedText ? `Add visible text “${addedText}”.` : "Change the element's child content.");
+  }
+  return changes.length ? changes : ["No element change was proposed."];
+}
+
+function buildHtmlDiff(originalCode, proposedCode) {
+  const lines = (markup) => markup.replace(/></g, ">\n<").split("\n").map((line) => line.trim()).filter(Boolean);
+  const before = lines(originalCode);
+  const after = lines(proposedCode);
+  const matrix = Array.from({ length: before.length + 1 }, () => Array(after.length + 1).fill(0));
+  for (let left = before.length - 1; left >= 0; left -= 1) {
+    for (let right = after.length - 1; right >= 0; right -= 1) {
+      matrix[left][right] = before[left] === after[right]
+        ? matrix[left + 1][right + 1] + 1
+        : Math.max(matrix[left + 1][right], matrix[left][right + 1]);
+    }
+  }
+  const diff = [];
+  let left = 0;
+  let right = 0;
+  while (left < before.length && right < after.length) {
+    if (before[left] === after[right]) {
+      diff.push({ type: "context", text: before[left++] });
+      right += 1;
+    } else if (matrix[left + 1][right] >= matrix[left][right + 1]) {
+      diff.push({ type: "remove", text: before[left++] });
+    } else {
+      diff.push({ type: "add", text: after[right++] });
+    }
+  }
+  while (left < before.length) diff.push({ type: "remove", text: before[left++] });
+  while (right < after.length) diff.push({ type: "add", text: after[right++] });
+  return diff;
+}
+
+function repairPreviewNote(repair) {
+  if (!repair?.proposedCode) return "";
+  if (["html-has-lang", "html-lang-valid"].includes(repair.violationId)) {
+    const parsed = new DOMParser().parseFromString(`${repair.proposedCode}<head></head><body></body></html>`, "text/html");
+    return `Document language: ${parsed.documentElement.lang || "missing"}${repair.demoContent ? " · demo value, confirm the actual language" : ""}`;
+  }
+  const template = document.createElement("template");
+  template.innerHTML = repair.proposedCode;
+  const element = template.content.firstElementChild;
+  if (!element) return "";
+  if (repair.violationId === "image-alt" && element.tagName === "IMG") {
+    return element.alt ? `Alternative text: ${element.alt}` : "Alternative text is empty; the image is marked decorative.";
+  }
+  if (repair.violationId === "label") {
+    const label = element.tagName === "LABEL" ? element : null;
+    const text = label
+      ? [...label.childNodes].filter((node) => node.nodeType === 3).map((node) => node.textContent.trim()).filter(Boolean).join(" ")
+      : element.getAttribute("aria-label");
+    return text ? `Visible field label: ${text}` : "The form label needs human review.";
+  }
+  if (["button-name", "link-name"].includes(repair.violationId)) {
+    const text = element.tagName === "INPUT" ? element.value : element.textContent.trim();
+    return text ? `Visible control text: ${text} · Accessible name: ${element.getAttribute("aria-label") ?? text}` : "The control name needs human review.";
+  }
+  return "";
+}
+
+function combineArtifactCss(sourceHtml, css = "") {
+  if (!css) return sourceHtml;
+  const document = new DOMParser().parseFromString(sourceHtml, "text/html");
+  const style = document.createElement("style");
+  style.textContent = css;
+  document.head.append(style);
+  return `<!doctype html>${document.documentElement.outerHTML}`;
+}
+
+function buildProposedArtifactPreview(sourceHtml, repair, additionalCss = "") {
+  if (!sourceHtml || !repair?.selector || !repair.originalCode || !repair.proposedCode || repair.originalCode === repair.proposedCode) return null;
+  try {
+    const previewDocument = new DOMParser().parseFromString(sourceHtml, "text/html");
+    if (additionalCss) {
+      const style = previewDocument.createElement("style");
+      style.textContent = additionalCss;
+      previewDocument.head.append(style);
+    }
+    const targets = previewDocument.querySelectorAll(repair.selector);
+    if (targets.length !== 1) return null;
+    if (["html-has-lang", "html-lang-valid"].includes(repair.violationId)) {
+      const serializedTag = targets[0].cloneNode(false).outerHTML;
+      if (serializedTag.slice(0, serializedTag.indexOf(">") + 1) !== repair.originalCode) return null;
+      const proposal = new DOMParser().parseFromString(`${repair.proposedCode}<head></head><body></body></html>`, "text/html");
+      previewDocument.documentElement.setAttribute("lang", proposal.documentElement.lang);
+      return `<!doctype html>${previewDocument.documentElement.outerHTML}`;
+    }
+    if (targets[0].outerHTML !== repair.originalCode) return null;
+
+    const replacement = previewDocument.createElement("template");
+    replacement.innerHTML = repair.proposedCode.trim();
+    if (replacement.content.children.length !== 1 || replacement.content.childNodes.length !== 1) return null;
+    targets[0].replaceWith(replacement.content.firstElementChild);
+    return `<!doctype html>${previewDocument.documentElement.outerHTML}`;
+  } catch {
+    return null;
+  }
 }
 
 export function ResultsPage() {
@@ -313,7 +446,7 @@ function RuleEvidence({ rule, kind }) {
 function buildPreviewDocument(sanitizedHtml) {
   const nonce = globalThis.crypto?.randomUUID?.().replaceAll("-", "") ?? `${Date.now()}${Math.random().toString(36).slice(2)}`;
   const encodedMarkup = JSON.stringify(sanitizedHtml).replaceAll("<", "\\u003c");
-  const controller = `const source=${encodedMarkup};document.body.innerHTML=source;window.addEventListener("message",function(event){if(event.source!==window.parent||event.data?.type!=="a11ypilot-highlight"||typeof event.data.selector!=="string")return;try{const target=document.querySelector(event.data.selector);if(!target)return;target.scrollIntoView({block:"center",behavior:"smooth"});target.style.setProperty("outline","3px solid #a89dff","important");target.style.setProperty("outline-offset","3px","important");setTimeout(()=>{target.style.removeProperty("outline");target.style.removeProperty("outline-offset")},3500)}catch{}},false);`;
+  const controller = `const source=${encodedMarkup};const parsed=new DOMParser().parseFromString(source,"text/html");if(parsed.documentElement.lang)document.documentElement.lang=parsed.documentElement.lang;document.body.innerHTML=parsed.body.innerHTML;window.addEventListener("message",function(event){if(event.source!==window.parent||event.data?.type!=="a11ypilot-highlight"||typeof event.data.selector!=="string")return;try{const target=document.querySelector(event.data.selector);if(!target)return;target.scrollIntoView({block:"center",behavior:"smooth"});target.style.setProperty("outline","3px solid #a89dff","important");target.style.setProperty("outline-offset","3px","important");setTimeout(()=>{target.style.removeProperty("outline");target.style.removeProperty("outline-offset")},3500)}catch{}},false);`;
   const policy = `default-src 'none'; script-src 'nonce-${nonce}'; connect-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; font-src data:; media-src data: blob:; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${policy}"><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{margin:0;padding:16px;background:#fff;color:#161922;font:14px/1.5 system-ui,sans-serif}</style></head><body></body><script nonce="${nonce}">${controller}</script></html>`;
 }
@@ -328,7 +461,7 @@ export function RepairWorkspacePage() {
   const [nodeIndex, setNodeIndex] = useState(0);
   const [provider, setProvider] = useState(null);
   const [repair, setRepair] = useState(null);
-  const [existingRepairs, setExistingRepairs] = useState([]);
+  const [previewError, setPreviewError] = useState("");
   const [artifacts, setArtifacts] = useState([]);
   const [artifactId, setArtifactId] = useState("");
   const [loading, setLoading] = useState(true);
@@ -336,6 +469,7 @@ export function RepairWorkspacePage() {
   const [error, setError] = useState("");
   const [dialogAction, setDialogAction] = useState("");
   const [manualConfirmed, setManualConfirmed] = useState(false);
+  const [suggestionFailure, setSuggestionFailure] = useState("");
   const dialogRef = useRef(null);
   const returnFocusRef = useRef(null);
   const notify = useToast();
@@ -375,17 +509,15 @@ export function RepairWorkspacePage() {
     const controller = new AbortController();
     setLoading(true);
     setError("");
-    Promise.all([
-      getAudit(auditId, { signal: controller.signal }),
-      getAuditRepairs(auditId, { signal: controller.signal }),
-    ]).then(([{ audit: selectedAudit }, { repairs: records }]) => {
+    setRepair(null);
+    setSuggestionFailure("");
+    setPreviewError("");
+    getAudit(auditId, { signal: controller.signal }).then(({ audit: selectedAudit }) => {
         setAudit(selectedAudit);
-        setExistingRepairs(records);
         setViolationId((current) => selectedAudit.violations.some((item) => item.id === current)
           ? current
           : selectedAudit.violations[0]?.id ?? "");
         setNodeIndex(0);
-        setRepair(records.at(-1) ?? null);
       })
       .catch((requestError) => {
         if (requestError.name !== "AbortError") setError(requestError.message);
@@ -398,6 +530,7 @@ export function RepairWorkspacePage() {
 
   const selectedViolation = audit?.violations.find((item) => item.id === violationId) ?? null;
   const selectedNode = selectedViolation?.nodes[nodeIndex] ?? null;
+  const hasPatchCandidate = Boolean(repair?.proposedCode?.trim() && repair.proposedCode !== repair.originalCode);
 
   useEffect(() => {
     if (dialogAction) dialogRef.current?.focus();
@@ -412,6 +545,9 @@ export function RepairWorkspacePage() {
     }
     setWorking(true);
     setError("");
+    setRepair(null);
+    setSuggestionFailure("");
+    setPreviewError("");
     setManualConfirmed(false);
     try {
       const { repair: suggestion } = await suggestRepair({
@@ -420,12 +556,23 @@ export function RepairWorkspacePage() {
         violationId: selectedViolation.id,
         nodeIndex,
       });
-      setRepair(suggestion);
-      setExistingRepairs((current) => [...current.filter((record) => record.id !== suggestion.id), suggestion]);
+      let originalArtifactPreview = null;
+      let proposedArtifactPreview = null;
+      if (suggestion.proposedCode !== suggestion.originalCode) {
+        try {
+          const { artifact: sourceArtifact } = await getControlledArtifact(artifactId);
+          originalArtifactPreview = combineArtifactCss(sourceArtifact.html, sourceArtifact.additionalCss);
+          proposedArtifactPreview = buildProposedArtifactPreview(sourceArtifact.html, suggestion, sourceArtifact.additionalCss);
+          if (!proposedArtifactPreview) setPreviewError("The proposed element could not be matched to the controlled artifact, so its page preview is unavailable.");
+        } catch {
+          setPreviewError("The controlled artifact could not be loaded for a proposed preview. The code patch is still available for review.");
+        }
+      }
+      setRepair({ ...suggestion, originalArtifactPreview, proposedArtifactPreview });
       if (suggestion.providerStatus) setProvider(suggestion.providerStatus);
       notify(suggestion.source === "groq" ? "Groq repair suggestion is ready for review." : "A deterministic or manual fallback is ready.", "success");
     } catch (requestError) {
-      setError(requestError.message);
+      setSuggestionFailure(requestError.message || "The repair suggestion could not be generated. Try again.");
     } finally {
       setWorking(false);
     }
@@ -440,8 +587,12 @@ export function RepairWorkspacePage() {
         reviewedPatchHash: repair.patchHash,
         artifactVersion: repair.artifactVersion,
       });
-      setRepair(accepted);
-      setExistingRepairs((current) => current.map((record) => record.id === accepted.id ? accepted : record));
+      setRepair({
+        ...accepted,
+        demoContent: repair.demoContent,
+        originalArtifactPreview: repair.originalArtifactPreview,
+        proposedArtifactPreview: repair.proposedArtifactPreview,
+      });
       setDialogAction("");
       notify("Patch applied to the controlled repair artifact. It is not verified.", "success");
     } catch (requestError) {
@@ -458,7 +609,6 @@ export function RepairWorkspacePage() {
     try {
       const { repair: rejected } = await rejectRepair(repair.id);
       setRepair(rejected);
-      setExistingRepairs((current) => current.map((record) => record.id === rejected.id ? rejected : record));
       notify("Repair suggestion rejected.", "info");
     } catch (requestError) {
       setError(requestError.message);
@@ -473,8 +623,12 @@ export function RepairWorkspacePage() {
     setError("");
     try {
       const { repair: rolledBack } = await rollbackRepair(repair.id);
-      setRepair(rolledBack);
-      setExistingRepairs((current) => current.map((record) => record.id === rolledBack.id ? rolledBack : record));
+      setRepair({
+        ...rolledBack,
+        demoContent: repair.demoContent,
+        originalArtifactPreview: repair.originalArtifactPreview,
+        proposedArtifactPreview: repair.proposedArtifactPreview,
+      });
       setDialogAction("");
       notify("The controlled artifact was rolled back to its original source.", "success");
     } catch (requestError) {
@@ -486,7 +640,29 @@ export function RepairWorkspacePage() {
 
   async function copyCode(value, label) {
     try {
-      await navigator.clipboard.writeText(value);
+      if (navigator.clipboard?.writeText) {
+        try {
+          await navigator.clipboard.writeText(value);
+          notify(`${label} copied.`, "success");
+          return;
+        } catch {
+          // Clipboard permission can fail even when the API exists; try the legacy copy path.
+        }
+      }
+      const copyField = document.createElement("textarea");
+      copyField.value = value;
+      copyField.setAttribute("readonly", "");
+      copyField.style.position = "fixed";
+      copyField.style.opacity = "0";
+      document.body.append(copyField);
+      let copied = false;
+      try {
+        copyField.select();
+        copied = document.execCommand("copy");
+      } finally {
+        copyField.remove();
+      }
+      if (!copied) throw new Error("Copy command failed");
       notify(`${label} copied.`, "success");
     } catch {
       setError("Clipboard access is unavailable. Select and copy the code manually.");
@@ -510,23 +686,18 @@ export function RepairWorkspacePage() {
             </select>
           </label>
           <label className="field-label" htmlFor="repair-violation-select">Accessibility violation
-            <select id="repair-violation-select" className="settings-select" value={violationId} onChange={(event) => { setViolationId(event.target.value); setNodeIndex(0); setRepair(null); }} disabled={!audit?.violations.length || working}>
+          <select id="repair-violation-select" className="settings-select" value={violationId} onChange={(event) => { setViolationId(event.target.value); setNodeIndex(0); setRepair(null); setSuggestionFailure(""); }} disabled={!audit?.violations.length || working}>
               {!audit?.violations.length && <option value="">No violations in this audit</option>}
               {audit?.violations.map((violation) => <option value={violation.id} key={violation.id}>[{violation.impact ?? "review"}] {violation.id} · {violation.help}</option>)}
             </select>
           </label>
           <label className="field-label" htmlFor="repair-node-select">Affected element
-            <select id="repair-node-select" className="settings-select" value={nodeIndex} onChange={(event) => { setNodeIndex(Number(event.target.value)); setRepair(null); }} disabled={!selectedViolation?.nodes.length || working}>
+          <select id="repair-node-select" className="settings-select" value={nodeIndex} onChange={(event) => { setNodeIndex(Number(event.target.value)); setRepair(null); setSuggestionFailure(""); }} disabled={!selectedViolation?.nodes.length || working}>
               {selectedViolation?.nodes.map((node, index) => <option value={index} key={`${node.selector}-${index}`}>{node.selector || node.targets.join(", ") || `Element ${index + 1}`}</option>)}
             </select>
           </label>
         </div>
-        {existingRepairs.length > 0 && <label className="field-label repair-history-select" htmlFor="repair-history-select">Existing repair suggestions
-          <select id="repair-history-select" className="settings-select" value={repair?.id ?? ""} onChange={(event) => setRepair(existingRepairs.find((record) => record.id === event.target.value) ?? null)}>
-            {existingRepairs.map((record) => <option value={record.id} key={record.id}>{record.violationId} · {record.status} · {new Date(record.createdAt).toLocaleString()}</option>)}
-          </select>
-        </label>}
-        {selectedViolation && selectedNode && <div className="repair-finding-summary"><div className="violation-card-heading"><span className={`impact-badge impact-${selectedViolation.impact ?? "moderate"}`}>{selectedViolation.impact ?? "needs review"}</span><span className="violation-rule-id">{selectedViolation.id}</span>{selectedViolation.wcagCriteria.map((criterion) => <span className="wcag-badge" key={criterion}>{criterion}</span>)}</div><h3>{selectedViolation.help}</h3><p>{selectedViolation.description}</p><code>{selectedNode.selector}</code><pre className="evidence-html">{selectedNode.html}</pre><p className="form-footer-note"><Info size={14} /> Only this affected element and bounded surrounding context are sent to Groq when a suggestion is requested. Scanned HTML is untrusted data, never instructions.</p></div>}
+        {selectedViolation && selectedNode && <div className="repair-finding-summary"><div className="violation-card-heading"><span className={`impact-badge impact-${selectedViolation.impact ?? "moderate"}`}>{selectedViolation.impact ?? "needs review"}</span><span className="violation-rule-id">{selectedViolation.id}</span>{selectedViolation.wcagCriteria.map((criterion) => <span className="wcag-badge" key={criterion}>{criterion}</span>)}</div><h3>{selectedViolation.help}</h3><p>{selectedViolation.description}</p><code>{selectedNode.selector}</code>{!repair && <pre className="evidence-html">{selectedNode.html}</pre>}<p className="form-footer-note"><Info size={14} /> Only this affected element and bounded surrounding context are sent to Groq when a suggestion is requested. Scanned HTML is untrusted data, never instructions.</p></div>}
         {!loading && !error && !audits.length && <EmptyState eyebrow="Start from actual scan output" title="No completed audit is available." description="Run a real URL or HTML audit first. Repair suggestions are never generated from seeded or invented findings." actionLabel="Run an accessibility audit" />}
         {audit && !audit.violations.length && <EmptyState eyebrow="This audit has no violations" title="No repair is needed from these results." description="Incomplete checks and keyboard review candidates require human assessment and are not represented as automated violations." actionLabel="Review audit results" actionTo={`/audits/results?auditId=${encodeURIComponent(audit.id)}`} />}
         <div className="repair-controls-row">
@@ -539,10 +710,22 @@ export function RepairWorkspacePage() {
 
       {error && <p className="form-message form-message-error" role="alert"><CircleAlert size={15} />{error}</p>}
 
+      {!repair && suggestionFailure && <section className="repair-review panel" aria-labelledby="repair-failure-title">
+        <div className="repair-review-header"><div><p className="eyebrow">02 · REPAIR RESULT</p><h2 id="repair-failure-title">Suggestion unavailable</h2></div><span className="repair-state repair-state-needs_review">not generated</span></div>
+        <p className="repair-no-patch" role="alert"><CircleAlert size={15} />{suggestionFailure} The original finding is still available; retry when ready.</p>
+        <section className="repair-corrected-code" aria-labelledby="repair-failed-code-title">
+          <div className="repair-code-head"><div><h3 id="repair-failed-code-title">Corrected code</h3><span className="repair-code-meta">HTML · affected element</span></div>
+            <button type="button" className="quiet-button" aria-label="Copy corrected code" disabled><ClipboardCheck size={14} /> Copy code</button>
+          </div>
+          <div className="repair-no-patch"><Info size={15} /><span>No corrected code was generated, so there is nothing to copy. Use Generate Fix Suggestion to retry.</span></div>
+          <p className="form-footer-note">The original element remains available in the finding evidence above.</p>
+        </section>
+      </section>}
+
       {repair && <section className="repair-review panel" aria-labelledby="repair-review-title">
         <div className="repair-review-header"><div><p className="eyebrow">02 · REVIEW THE PATCH</p><h2 id="repair-review-title">{repair.source === "groq" ? "Groq-generated suggestion" : "Deterministic / manual suggestion"}</h2></div><span className={`repair-state repair-state-${repair.status}`}>{repair.status.replace("_", " ")}</span></div>
         {repair.fallbackReason && <p className="repair-fallback-note"><Info size={15} />{repair.fallbackReason}</p>}
-        <p>{repair.explanation}</p><p className="repair-rationale"><strong>Accessibility rationale</strong> {repair.accessibilityRationale}</p>
+        <p className="eyebrow repair-result-label">ISSUE IDENTIFIED</p><p>{repair.explanation || `The selected ${repair.violationId} finding needs an accessibility correction.`}</p><p className="repair-rationale"><strong>Accessibility rationale</strong> {repair.accessibilityRationale}</p>
         {repair.cssPatch && <section className="repair-css-patch" aria-label="CSS repair details">
           <strong>{repair.applicable ? "CSS-only patch" : "CSS evidence"} · {repair.cssPatch.application}</strong>
           <code>Target: {repair.cssPatch.targetSelector}</code>
@@ -563,10 +746,22 @@ export function RepairWorkspacePage() {
         {repair.expectedVerificationCriteria?.length > 0 && <div className="repair-assumptions"><strong>Expected verification criteria</strong><ul>{repair.expectedVerificationCriteria.map((criterion) => <li key={criterion}>{criterion}</li>)}</ul></div>}
         {repair.assumptions.length > 0 && <div className="repair-assumptions"><strong>Assumptions to check</strong><ul>{repair.assumptions.map((assumption) => <li key={assumption}>{assumption}</li>)}</ul></div>}
         {repair.manualReviewRequired && <p className="repair-manual-warning"><CircleAlert size={15} /> Human review required before applying. Confirm the proposed content is accurate and appropriate.</p>}
-        {repair.applicable ? <div className="repair-diff" aria-label="Before and after code diff">
-          <section><div className="repair-code-head"><h3>Original</h3><button type="button" className="quiet-button" onClick={() => void copyCode(repair.originalCode, "Original code")} aria-label="Copy original code"><ClipboardCheck size={14} /> Copy</button></div><pre className="repair-code"><code>{highlightMarkup(repair.originalCode)}</code></pre></section>
-          <section><div className="repair-code-head"><h3>Proposed</h3><button type="button" className="quiet-button" onClick={() => void copyCode(repair.proposedCode, "Proposed code")} aria-label="Copy proposed code"><ClipboardCheck size={14} /> Copy</button></div><pre className="repair-code repair-code-proposed"><code>{highlightMarkup(repair.proposedCode)}</code></pre></section>
-        </div> : <div className="repair-no-patch"><Info size={15} /><span>No automatic patch is safe for this finding. Use the explanation to make and review a contextual manual change.</span></div>}
+        <section className="repair-corrected-code" aria-labelledby="repair-corrected-code-title">
+          <div className="repair-code-head"><div><h3 id="repair-corrected-code-title">Review the HTML patch</h3><span className="repair-code-meta">HTML · selected element · human approval required</span></div></div>
+          {repair.requiresHumanInput && <p className="repair-manual-warning" role="status"><CircleAlert size={15} /> This patch contains a provisional accessible name. Replace the placeholder with the control’s real action before treating it as a final fix; provisional patches cannot be applied or verified.</p>}
+        {repair.demoContent && <p className="repair-manual-warning" role="status"><CircleAlert size={15} /> This patch uses demo text because the correct meaning was not established by the source. Replace it with accurate wording and confirm its purpose before applying. A rescan checks the accessibility rule, not whether demo wording is semantically correct.</p>}
+          <div className="repair-diff" aria-label="Before and after HTML patch">
+            <section><div className="repair-code-head"><h3>BEFORE</h3><button type="button" className="quiet-button" onClick={() => void copyCode(repair.originalCode, "Original code")} aria-label="Copy original code" disabled={!repair.originalCode}><ClipboardCheck size={14} /> Copy original</button></div><pre className="repair-code"><code>{highlightMarkup(repair.originalCode ?? "")}</code></pre></section>
+            <section><div className="repair-code-head"><h3>{repair.requiresHumanInput ? "AFTER · PROVISIONAL PATCH" : "AFTER · PROPOSED PATCH"}</h3><button type="button" className="quiet-button" onClick={() => void copyCode(repair.proposedCode, "Proposed code")} aria-label="Copy corrected code" disabled={!hasPatchCandidate}><ClipboardCheck size={14} /> Copy patch</button></div>
+              {hasPatchCandidate ? <pre className={`repair-code repair-code-proposed${repair.requiresHumanInput ? " repair-code-provisional" : ""}`}><code>{highlightMarkup(repair.proposedCode)}</code></pre> : <div className="repair-no-patch" role="status"><Info size={15} /><span>No code change was generated for this finding. The original element is shown alongside so you can retain and copy its exact source.</span></div>}
+            </section>
+          </div>
+          {hasPatchCandidate && <div className="repair-assumptions repair-patch-changes"><strong>Changes in this patch</strong><ul>{summarizeHtmlPatch(repair.originalCode, repair.proposedCode).map((change) => <li key={change}>{change}</li>)}</ul></div>}
+          {hasPatchCandidate && <div className="repair-readable-diff" aria-label="Readable HTML patch diff"><div className="repair-code-head"><h3>Readable diff</h3></div><pre>{buildHtmlDiff(repair.originalCode, repair.proposedCode).map((line, index) => <code className={`repair-diff-line repair-diff-line-${line.type}`} key={`${index}-${line.type}`}><span aria-hidden="true">{line.type === "add" ? "+" : line.type === "remove" ? "−" : " "}</span>{line.text}</code>)}</pre></div>}
+          {repair.originalArtifactPreview && repair.proposedArtifactPreview && repair.status === "proposed" && <div className="repair-proposed-preview"><div className="repair-code-head"><div><h3>Before and after preview</h3><span className="repair-code-meta">Isolated local preview · artifact unchanged until approval</span></div></div><div className="repair-preview-grid"><section><h4>Original page</h4><iframe title="Original artifact preview before repair" sandbox="allow-scripts" srcDoc={buildPreviewDocument(repair.originalArtifactPreview)} className="audit-preview-frame" /></section><section><h4>Proposed page</h4><iframe title="Proposed repair preview, not applied" sandbox="allow-scripts" srcDoc={buildPreviewDocument(repair.proposedArtifactPreview)} className="audit-preview-frame" /></section></div>{repairPreviewNote(repair) && <p className="repair-preview-note"><Info size={14} />{repairPreviewNote(repair)}</p>}</div>}
+          {!repair.proposedArtifactPreview && previewError && <p className="repair-fallback-note"><Info size={15} />{previewError}</p>}
+          <p className="form-footer-note"><Info size={14} /> A proposal does not change the controlled artifact. Review the exact diff, then approve an applicable patch; verify it with a new scan.</p>
+        </section>
         {repair.status === "proposed" && <div className="repair-actions">
           <button type="button" className="button button-secondary" onClick={() => void rejectSuggestion()} disabled={working}><X size={15} /> Reject Fix</button>
           <button type="button" className="button button-secondary" onClick={() => void createSuggestion()} disabled={working}><RotateCcw size={14} /> Regenerate Suggestion</button>
@@ -574,8 +769,11 @@ export function RepairWorkspacePage() {
         </div>}
         {["applied", "verified", "needs_review"].includes(repair.status) && <div className="repair-applied-block">
           <p className="repair-verified-label"><ShieldCheck size={15} /> Applied to controlled artifact · <strong>{repair.status === "verified" ? "Verified by rescan" : repair.status === "needs_review" ? "Needs review" : "Not verified"}</strong></p>
-          <div className="repair-code-head"><h3>Updated artifact preview</h3><button type="button" className="quiet-button" onClick={() => void copyCode(repair.updatedArtifact, "Updated artifact")}><ClipboardCheck size={14} /> Copy artifact</button></div>
-          <iframe title="Applied repair artifact preview" sandbox="allow-scripts" srcDoc={buildPreviewDocument(repair.updatedArtifact)} className="audit-preview-frame" />
+          {repair.demoContent && repair.contentHumanConfirmed !== true && <p className="repair-manual-warning" role="status"><CircleAlert size={15} /> The rescan checks that the accessibility rule no longer fails; the demo wording has not been human-confirmed as an accurate description.</p>}
+          {repair.demoContent && repair.contentHumanConfirmed === true && <p className="form-footer-note">You confirmed the demo wording during approval. A rescan verifies the accessibility rule result; it does not assess the wording's quality.</p>}
+          <div className="repair-code-head"><h3>Before and after artifact preview</h3><button type="button" className="quiet-button" onClick={() => void copyCode(repair.updatedArtifact, "Updated artifact")}><ClipboardCheck size={14} /> Copy artifact</button></div>
+          <div className="repair-preview-grid"><section><h4>Original page</h4><iframe title="Original artifact preview before repair" sandbox="allow-scripts" srcDoc={buildPreviewDocument(repair.originalArtifactPreview ?? repair.sourceArtifact ?? repair.rollbackArtifact ?? "")} className="audit-preview-frame" /></section><section><h4>Applied repair</h4><iframe title="Applied repair artifact preview" sandbox="allow-scripts" srcDoc={buildPreviewDocument(repair.updatedArtifact)} className="audit-preview-frame" /></section></div>
+          {repairPreviewNote(repair) && <p className="repair-preview-note"><Info size={14} />{repairPreviewNote(repair)}</p>}
           <div className="repair-actions">
             {repair.status !== "verified" && <Link className="button button-primary" to={`/verification?auditId=${encodeURIComponent(repair.auditId)}&repairId=${encodeURIComponent(repair.id)}`}><ClipboardCheck size={14} /> Verify repaired artifact</Link>}
             <button type="button" className="button button-secondary" onClick={(event) => { returnFocusRef.current = event.currentTarget; setDialogAction("rollback"); }} disabled={working}><RotateCcw size={14} /> Roll back patch</button>

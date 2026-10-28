@@ -28,6 +28,7 @@ import { useToast } from "./useToast.js";
 const navigation = [
   { label: "Overview", to: "/", icon: LayoutDashboard, end: true },
   { label: "New audit", to: "/audits/new", icon: Sparkles },
+  { label: "Fix all issues", to: "/fix-all", icon: WandSparkles },
   { label: "Audit results", to: "/audits/results", icon: Gauge },
 ];
 
@@ -40,6 +41,7 @@ const workspaceLinks = [
 const titles = {
   "/": "Overview",
   "/audits/new": "New audit",
+  "/fix-all": "Fix all issues",
   "/audits/results": "Audit results",
   "/workspace": "Repair workspace",
   "/verification": "Verification",

@@ -7,7 +7,8 @@ import { htmlAuditRequestSchema, urlAuditRequestSchema } from "./schemas.js";
 import { getScannerDiagnostics, scanAudit, scannerConfiguration } from "./scanner.js";
 import { applyRepairSchema, controlledArtifactSchema, repairInputSchema, RepairError } from "./repairs/repairEngine.js";
 import { repairService as defaultRepairService } from "./repairs/repairService.js";
-import { createVerificationRecord, freezeSnapshot } from "./verification/engine.js";
+import { BulkRepairService, bulkApplySchema, bulkDraftHash, bulkRepairInputSchema } from "./repairs/bulkRepairService.js";
+import { compareAudits, createVerificationRecord, freezeSnapshot } from "./verification/engine.js";
 import { buildAuditReport, renderAuditReportHtml } from "./reports/auditReport.js";
 import { authService } from "./auth.js";
 import { getDatabaseStatus } from "./database.js";
@@ -120,6 +121,7 @@ export function createApp({
   auditStore = new Map(),
   repairStore = new Map(),
   repairs = defaultRepairService,
+  bulkRepairs: suppliedBulkRepairs = null,
   verificationStore = new Map(),
   artifactStore = new Map(),
   controlledArtifactStore = new Map(),
@@ -128,6 +130,7 @@ export function createApp({
   storageName = repository ? "mongodb" : "in_memory",
 } = {}) {
   const app = express();
+  const bulkRepairs = suppliedBulkRepairs ?? new BulkRepairService({ repairService: repairs, scan });
   app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
   const configuredOrigin = process.env.FRONTEND_ORIGIN ?? "http://localhost:5173";
   const allowedOrigins = process.env.NODE_ENV === "production"
@@ -299,7 +302,11 @@ export function createApp({
   app.get("/api/artifacts/", (request, response) => {
     const artifacts = [...request.workspace.controlledArtifacts.values()]
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
-      .map(({ id, name, auditId, version, createdAt, updatedAt }) => ({ id, name, auditId, version, createdAt, updatedAt }));
+      .map(({ id, name, auditId, version, createdAt, updatedAt, bulkRollback }) => ({
+        id, name, auditId, version, createdAt, updatedAt,
+        bulkRollbackAvailable: Boolean(bulkRollback),
+        ...(bulkRollback ? { bulkDraftId: bulkRollback.draftId } : {}),
+      }));
     return response.json({ requestId: request.requestId, artifacts, storage: storageName });
   });
 
@@ -310,12 +317,14 @@ export function createApp({
     }
     let { html } = parsedRequest.data;
     let auditId = null;
+    let additionalCss = parsedRequest.data.additionalCss ?? "";
     if (parsedRequest.data.sourceAuditId) {
       const sourceAudit = request.workspace.audits.get(parsedRequest.data.sourceAuditId);
-      if (!sourceAudit || sourceAudit.sourceType !== "html" || !sourceAudit.previewHtml) {
-        return response.status(404).json(apiError(request.requestId, "AUDIT_NOT_FOUND", "Only an owned pasted-HTML audit can be used as an artifact source."));
+      if (!sourceAudit || !(sourceAudit.previewHtml || sourceAudit.renderedHtml)) {
+        return response.status(404).json(apiError(request.requestId, "AUDIT_NOT_FOUND", "This audit does not have a safely captured HTML source."));
       }
-      html = sourceAudit.previewHtml;
+      html = sourceAudit.sourceType === "url" ? sourceAudit.renderedHtml : html;
+      additionalCss ||= sourceAudit.capturedCss ?? sourceAudit.additionalCss ?? "";
       auditId = sourceAudit.id;
     }
     const now = new Date().toISOString();
@@ -323,6 +332,7 @@ export function createApp({
       id: randomUUID(),
       name: parsedRequest.data.name,
       html,
+      additionalCss,
       auditId,
       version: 1,
       createdAt: now,
@@ -351,7 +361,12 @@ export function createApp({
   app.get("/api/artifacts/:artifactId", (request, response) => {
     const artifact = request.workspace.controlledArtifacts.get(request.params.artifactId);
     if (!artifact) return response.status(404).json(apiError(request.requestId, "ARTIFACT_NOT_FOUND", "This controlled artifact is no longer available."));
-    return response.json({ requestId: request.requestId, artifact });
+    const { bulkRollback, ...publicArtifact } = artifact;
+    return response.json({ requestId: request.requestId, artifact: {
+      ...publicArtifact,
+      bulkRollbackAvailable: Boolean(bulkRollback),
+      ...(bulkRollback ? { bulkDraftId: bulkRollback.draftId } : {}),
+    } });
   });
 
   app.get("/api/audits/:auditId", (request, response) => {
@@ -406,6 +421,133 @@ export function createApp({
     const report = buildAuditReport({ audit, repairs: repairsForAudit, verifications });
     response.type("html").set("Content-Disposition", `attachment; filename="accessz-audit-${audit.id}.html"`);
     return response.send(renderAuditReportHtml(report));
+  });
+
+  app.post("/api/repairs/bulk/suggest", async (request, response) => {
+    const parsedRequest = bulkRepairInputSchema.safeParse(request.body);
+    if (!parsedRequest.success) {
+      return response.status(400).json(apiError(request.requestId, "VALIDATION_ERROR", "The bulk repair request is invalid.", publicValidationIssues(parsedRequest.error)));
+    }
+    const audit = request.workspace.audits.get(parsedRequest.data.auditId);
+    const artifact = request.workspace.controlledArtifacts.get(parsedRequest.data.artifactId);
+    if (!audit) return response.status(404).json(apiError(request.requestId, "AUDIT_NOT_FOUND", "This audit is no longer available."));
+    if (!artifact || artifact.auditId !== audit.id) return response.status(404).json(apiError(request.requestId, "ARTIFACT_NOT_FOUND", "This controlled artifact is not associated with the selected audit."));
+    const controller = new AbortController();
+    const abortOnDisconnect = () => { if (!response.writableEnded) controller.abort(); };
+    request.once("aborted", abortOnDisconnect);
+    response.once("close", abortOnDisconnect);
+    try {
+      const draft = await bulkRepairs.propose({
+        audit,
+        artifact,
+        userId: request.user.id,
+        signal: controller.signal,
+        requestId: request.requestId,
+      });
+      const publicDraft = { ...draft };
+      delete publicDraft.userId;
+      delete publicDraft.baselineAudit;
+      return response.status(201).json({ requestId: request.requestId, draft: publicDraft });
+    } catch (error) {
+      return handleRepairError(error, request.requestId, response);
+    } finally {
+      request.removeListener("aborted", abortOnDisconnect);
+    }
+  });
+
+  app.post("/api/repairs/bulk/apply", async (request, response) => {
+    const parsedRequest = bulkApplySchema.safeParse(request.body);
+    if (!parsedRequest.success) return response.status(400).json(apiError(request.requestId, "VALIDATION_ERROR", "Confirm and review the complete bulk patch before applying it.", publicValidationIssues(parsedRequest.error)));
+    const draft = bulkRepairs.get(parsedRequest.data.draftId, request.user.id);
+    if (!draft || draft.status !== "proposed") return response.status(404).json(apiError(request.requestId, "BULK_DRAFT_NOT_FOUND", "This bulk repair draft is no longer available. Generate and review it again."));
+    if (!draft.changes.length) return response.status(422).json(apiError(request.requestId, "NO_SAFE_PATCHES", "No validated patches are available to apply."));
+    const artifact = request.workspace.controlledArtifacts.get(draft.artifactId);
+    if (!artifact || artifact.auditId !== draft.auditId) return response.status(404).json(apiError(request.requestId, "ARTIFACT_NOT_FOUND", "The controlled artifact is unavailable."));
+    if (artifact.version !== parsedRequest.data.artifactVersion
+      || artifact.version !== draft.artifactVersion
+      || parsedRequest.data.patchHash !== draft.patchHash
+      || bulkDraftHash(artifact) !== draft.sourceHash) {
+      return response.status(409).json(apiError(request.requestId, "ARTIFACT_VERSION_CONFLICT", "The controlled source changed after review. Generate and inspect a fresh bulk repair draft."));
+    }
+    const updated = {
+      ...artifact,
+      html: draft.repairedHtml,
+      additionalCss: draft.repairedCss,
+      version: artifact.version + 1,
+      updatedAt: new Date().toISOString(),
+      bulkRollback: {
+        draftId: draft.id,
+        html: artifact.html,
+        additionalCss: artifact.additionalCss ?? "",
+        appliedVersion: artifact.version + 1,
+        appliedHtml: draft.repairedHtml,
+      },
+    };
+    try {
+      await persistWorkspaceRecord(request, "artifact", updated);
+      Object.assign(artifact, updated);
+      draft.status = "applied";
+      draft.appliedVersion = updated.version;
+      draft.appliedAt = updated.updatedAt;
+      return response.json({ requestId: request.requestId, draft: { id: draft.id, status: draft.status, appliedVersion: updated.version }, artifact: { id: artifact.id, version: artifact.version, html: artifact.html, additionalCss: artifact.additionalCss } });
+    } catch (error) {
+      return response.status(error.status ?? 503).json(apiError(request.requestId, error.code ?? "PERSISTENCE_UNAVAILABLE", error.message));
+    }
+  });
+
+  app.post("/api/repairs/bulk/:draftId/verify", async (request, response) => {
+    const draft = bulkRepairs.get(request.params.draftId, request.user.id);
+    if (!draft || draft.status !== "applied") return response.status(409).json(apiError(request.requestId, "BULK_REPAIR_NOT_APPLIED", "Apply this reviewed bulk repair to its controlled artifact before verifying it."));
+    const artifact = request.workspace.controlledArtifacts.get(draft.artifactId);
+    if (!artifact || artifact.version !== draft.appliedVersion || artifact.html !== draft.repairedHtml) return response.status(409).json(apiError(request.requestId, "ARTIFACT_CHANGED", "The controlled artifact has changed since bulk repair was applied."));
+    try {
+      const afterAudit = await scan({
+        sourceType: "html",
+        html: artifact.html,
+        ...(artifact.additionalCss ? { additionalCss: artifact.additionalCss } : {}),
+        projectName: "Applied bulk repair verification",
+        wcagLevel: draft.baselineAudit.wcagLevel ?? "AA",
+        includeBestPractices: draft.baselineAudit.includeBestPractices ?? true,
+      }, { requestId: request.requestId });
+      const comparison = compareAudits(draft.baselineAudit, afterAudit);
+      const verified = comparison.remaining.length === 0 && comparison.newlyIntroduced.length === 0 && comparison.changed.length === 0;
+      draft.after = { violationCount: afterAudit.summary.violations, findings: afterAudit.violations, incomplete: afterAudit.incomplete };
+      draft.comparison = comparison;
+      draft.verification = {
+        status: verified ? "verified" : "needs_review",
+        verifiedAt: new Date().toISOString(),
+        remainingFindings: comparison.remaining.length,
+        resolvedFindings: comparison.resolved.length,
+        newFindings: comparison.newlyIntroduced.length,
+        changedFindings: comparison.changed.length,
+        manualReview: afterAudit.incomplete.length,
+      };
+      return response.json({ requestId: request.requestId, verification: draft.verification, comparison, audit: afterAudit });
+    } catch (error) {
+      return handleScanError(error, request.requestId, response);
+    }
+  });
+
+  app.post("/api/artifacts/:artifactId/bulk-rollback", async (request, response) => {
+    const artifact = request.workspace.controlledArtifacts.get(request.params.artifactId);
+    const rollback = artifact?.bulkRollback;
+    const draft = rollback ? bulkRepairs.get(rollback.draftId, request.user.id) : null;
+    if (!rollback || (request.body?.draftId && request.body.draftId !== rollback.draftId)) return response.status(404).json(apiError(request.requestId, "BULK_ROLLBACK_NOT_FOUND", "No matching applied bulk repair can be reverted."));
+    if (artifact.version !== rollback.appliedVersion || artifact.html !== rollback.appliedHtml) return response.status(409).json(apiError(request.requestId, "ARTIFACT_CHANGED", "The artifact changed after this bulk repair; refusing to overwrite newer work."));
+    const updated = { ...artifact, html: rollback.html, additionalCss: rollback.additionalCss, version: artifact.version + 1, updatedAt: new Date().toISOString() };
+    delete updated.bulkRollback;
+    try {
+      await persistWorkspaceRecord(request, "artifact", updated);
+      Object.assign(artifact, updated);
+      delete artifact.bulkRollback;
+      if (draft) {
+        draft.status = "rolled_back";
+        draft.rolledBackAt = updated.updatedAt;
+      }
+      return response.json({ requestId: request.requestId, draft: { id: rollback.draftId, status: "rolled_back" }, artifact: { id: artifact.id, version: artifact.version, html: artifact.html, additionalCss: artifact.additionalCss } });
+    } catch (error) {
+      return response.status(error.status ?? 503).json(apiError(request.requestId, error.code ?? "PERSISTENCE_UNAVAILABLE", error.message));
+    }
   });
 
   app.post("/api/repairs/suggest", async (request, response) => {
@@ -591,6 +733,7 @@ export function createApp({
     const input = {
       sourceType: "html",
       html: repair.appliedArtifact,
+      ...(repair.additionalCss ? { additionalCss: repair.additionalCss } : {}),
       projectName: `${baseline.projectName ?? "Audit"} · repair verification`,
       wcagLevel: baseline.wcagLevel,
       includeBestPractices: baseline.includeBestPractices,
@@ -612,17 +755,21 @@ export function createApp({
   });
 
   app.post("/api/audits/:auditId/verify", async (request, response) => {
-    const { audits: auditStore, repairs: repairStore, artifacts: artifactStore } = request.workspace;
+    const { audits: auditStore, repairs: repairStore, artifacts: artifactStore, controlledArtifacts } = request.workspace;
     const baseline = auditStore.get(request.params.auditId);
     if (!baseline) return response.status(404).json(apiError(request.requestId, "AUDIT_NOT_FOUND", "This audit is no longer available."));
-    const controlledArtifact = artifactStore.get(baseline.id);
+    const artifactRecord = [...controlledArtifacts.values()].find((item) => item.auditId === baseline.id);
+    const controlledArtifact = artifactStore.get(baseline.id) ?? artifactRecord?.html;
     const urlRepairs = [...repairStore.values()].filter((repair) => repair.auditId === baseline.id && repair.sourceArtifact);
-    const controlledUrlBaseline = baseline.sourceType === "url" && controlledArtifact ? urlRepairs[0]?.sourceArtifact : null;
+    const controlledUrlBaseline = baseline.sourceType === "url" && controlledArtifact
+      ? urlRepairs[0]?.sourceArtifact ?? baseline.renderedHtml ?? null
+      : null;
     const useControlledHtml = Boolean(controlledArtifact) || baseline.sourceType === "html";
     const input = useControlledHtml
       ? {
           sourceType: "html",
           html: controlledArtifact ?? baseline.previewHtml,
+          ...(artifactRecord?.additionalCss ? { additionalCss: artifactRecord.additionalCss } : {}),
           projectName: `${baseline.projectName ?? "Audit"} · full verification`,
           wcagLevel: baseline.wcagLevel,
           includeBestPractices: baseline.includeBestPractices,
@@ -639,6 +786,7 @@ export function createApp({
         baselineInput: {
           sourceType: "html",
           html: controlledUrlBaseline,
+          ...(baseline.capturedCss ? { additionalCss: baseline.capturedCss } : {}),
           projectName: `${baseline.projectName ?? "Audit"} · controlled baseline`,
           wcagLevel: baseline.wcagLevel,
           includeBestPractices: baseline.includeBestPractices,
@@ -680,12 +828,15 @@ export function createApp({
       const { audits: auditStore } = request.workspace;
       auditStore.set(audit.id, audit);
       await persistWorkspaceRecord(request, "audit", audit);
-      if (audit.sourceType === "html" && audit.previewHtml) {
+      const artifactHtml = sourceType === "html" ? parsedRequest.data.html : audit.renderedHtml;
+      const artifactCss = sourceType === "html" ? parsedRequest.data.additionalCss ?? "" : audit.capturedCss ?? audit.additionalCss ?? "";
+      if (artifactHtml) {
         const now = new Date().toISOString();
         const artifact = {
           id: randomUUID(),
           name: audit.projectName ?? "Pasted HTML audit source",
-          html: audit.previewHtml,
+          html: artifactHtml,
+          additionalCss: artifactCss,
           auditId: audit.id,
           version: 1,
           createdAt: now,
