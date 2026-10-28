@@ -1,0 +1,35 @@
+{
+  "name": "@a11ypilot/backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --env-file-if-exists=.env src/server.js",
+    "start": "node --env-file-if-exists=.env scripts/start.js",
+    "postinstall": "node scripts/install-chromium.js",
+    "build": "node --check src/server.js && node --check src/app.js && node --check src/scanner.js && node --check src/verification/engine.js && node --check src/reports/auditReport.js",
+    "test": "vitest run",
+    "lint": "eslint src test"
+  },
+  "dependencies": {
+    "@axe-core/playwright": "^4.14.0",
+    "bcryptjs": "^3.0.3",
+    "color-name": "^2.0.0",
+    "connect-mongo": "^6.0.0",
+    "cors": "^2.8.5",
+    "dompurify": "^3.3.0",
+    "express": "^4.21.2",
+    "express-rate-limit": "^8.7.1",
+    "express-session": "^1.19.0",
+    "helmet": "^8.3.0",
+    "ipaddr.js": "^2.5.0",
+    "jsdom": "^26.1.0",
+    "mongoose": "^9.11.4",
+    "playwright": "^1.64.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "supertest": "^7.0.0",
+    "vitest": "^5.0.5"
+  }
+}
