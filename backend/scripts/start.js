@@ -1,3 +1,4 @@
 process.env.PLAYWRIGHT_BROWSERS_PATH = "0";
 
-await import("../src/server.js");
+const { startApiServer } = await import("../src/server.js");
+await startApiServer();
